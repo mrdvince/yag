@@ -1,64 +1,16 @@
 import argparse
 import collections
-import configparser
-import hashlib
+import logging
 import os
-import re
 import sys
-import zlib
+
+from utils import repo_file, repo_dir, repo_default_config
+from yag_obj import object_read, object_find, object_write
+from yag_repo import YagRepository
 
 argparser = argparse.ArgumentParser(description="Yet another yag")
 argsubparsers = argparser.add_subparsers(title="subcommands", dest="subcommand")
 argsubparsers.required = True
-
-
-class YagRepository:
-    worktree = None
-    gitdir = None
-    conf = None
-
-    def __init__(self, path, force: bool = False):
-        self.worktree = path
-        self.gitdir = os.path.join(path, ".yag")
-
-        if not (os.path.isdir(self.gitdir) or force):
-            raise Exception(f"Not a yag repository {path}")
-
-        self.conf = configparser.ConfigParser()
-        cf = repo_file(self, "config")
-
-        if cf and os.path.exists(cf):
-            self.conf.read([cf])
-        elif not force:
-            raise Exception(f"Configuration file missing")
-
-        if not force:
-            vers = int(self.conf.get("core", "repositoryformatversion"))
-            if vers != 0:
-                raise Exception(f"Unsupported repositoryformatversion {vers}")
-
-
-def repo_path(repo, *path):
-    return os.path.join(repo.gitdir, *path)
-
-
-def repo_file(repo, *path, mkdir=False):
-    if repo_dir(repo, *path[:-1], mkdir=mkdir):
-        return repo_path(repo, *path)
-
-
-def repo_dir(repo, *path, mkdir=False):
-    path = repo_path(repo, *path)
-    if os.path.exists(path):
-        if os.path.isdir(path):
-            return path
-        else:
-            raise Exception(f"Not a directory {path}")
-    if mkdir:
-        os.makedirs(path)
-        return path
-    else:
-        return None
 
 
 def repo_create(path):
@@ -90,15 +42,25 @@ def repo_create(path):
     return repo
 
 
-def repo_default_config():
-    ret = configparser.ConfigParser()
+def repo_find(path=".", required=True):
+    """Find the point where .yag folder is
 
-    ret.add_section("core")
-    ret.set("core", "repositoryformatversion", "0")
-    ret.set("core", "filemode", "false")
-    ret.set("core", "bare", "false")
+    Start at current folder and go up
+    the directory till the top most directory in the filesystem
+    """
+    path = os.path.realpath(path)
+    if os.path.isdir(os.path.join(path, ".yag")):
+        return YagRepository(path)
 
-    return ret
+    parent = os.path.realpath(os.path.join(path, ".."))
+    # if the parent and the current path are at the root not yag folder found
+    if parent == path:
+        if required:
+            raise Exception(f"Not a yag repo")
+        else:
+            return None
+    # recurse
+    repo_find(parent, required=required)
 
 
 argsp = argsubparsers.add_parser("init", help="Initialize a new, empty repository.")
@@ -109,7 +71,97 @@ argsp.add_argument(
     default=".",
     help="Where to create the repository.",
 )
+# git cat-file TYPE OBJECT
+argsp = argsubparsers.add_parser("cat-file",
+                                 help="Provide content of repository objects")
 
+argsp.add_argument("type",
+                   metavar="type",
+                   choices=["blob", "commit", "tag", "tree"],
+                   help="Specify the type")
+
+argsp.add_argument("object",
+                   metavar="object",
+                   help="The object to display")
+
+
+def cmd_cat_file(args):
+    repo = repo_find()
+    cat_file(repo, args.object, fmt=args.type.encode())
+
+
+def cat_file(repo, obj, fmt=None):
+    obj = object_read(repo, object_find(repo, obj, fmt=fmt))
+    sys.stdout.buffer.write(obj.serialize())
+
+
+# git hash-object [-w] [-t TYPE] FILE
+argsp = argsubparsers.add_parser(
+    "hash-object",
+    help="Compute object ID and optionally creates a blob from a file")
+
+argsp.add_argument("-t",
+                   metavar="type",
+                   dest="type",
+                   choices=["blob", "commit", "tag", "tree"],
+                   default="blob",
+                   help="Specify the type")
+
+argsp.add_argument("-w",
+                   dest="write",
+                   action="store_true",
+                   help="Actually write the object into the database")
+
+argsp.add_argument("path",
+                   help="Read object from <file>")
+
+
+def cmd_hash_object(args):
+    if args.write:
+        repo = YagRepository(".")
+    else:
+        repo = None
+
+    with open(args.path, 'rb') as f:
+        sha = object_hash(f, args.type.encode(), repo)
+        logging.info(sha)
+
+
+def object_hash(f, fmt, repo=None):
+    data = f.read()
+    # Choose constructor depending on
+    # object type found in header.
+    if fmt == b'commit':
+        obj = GitCommit(repo, data)
+    elif fmt == b'tree':
+        obj = GitTree(repo, data)
+    elif fmt == b'tag':
+        obj = GitTag(repo, data)
+    elif fmt == b'blob':
+        obj = GitBlob(repo, data)
+    else:
+        raise Exception("Unknown type %s!" % fmt)
+    return object_write(obj, repo)
+
+
+def kvlm_parse(raw, start=0, dct=None):
+    """Key value list message
+
+    """
+    if not dct:
+        dct = collections.OrderedDict()
+    # Next space and line
+    spc = raw.find(b' ', start)
+    n_line = raw.find(b'\n', start)
+
+    # If space appears before new line, that's a keyword
+    # Base case
+    # =========
+    # If newline appears first (or there's no space at all, in which
+    # case find returns -1), we assume a blank line.  A blank line
+    # means the remainder of the data is the message.
+    if (spc < 0) or (n_line < spc):
+        assert n_line == start
 
 def cmd_init(args):
     repo_create(args.path)
